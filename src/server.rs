@@ -1,7 +1,7 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 
 use quinn::{
-    Endpoint, Incoming, ServerConfig,
+    Endpoint, Incoming, RecvStream, SendStream, ServerConfig,
     rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
 };
 use tokio::net::TcpStream;
@@ -37,31 +37,8 @@ pub async fn handle_incoming(conn: Incoming, forward_to: SocketAddr) -> anyhow::
     loop {
         let conn = conn.clone();
         match conn.accept_bi().await {
-            Ok((mut send, mut recv)) => {
-                tokio::spawn(async move {
-                    println!("QUIC: {} -> TCP: {}", conn.remote_address(), forward_to);
-                    match TcpStream::connect(forward_to).await {
-                        Ok(tcp) => {
-                            let (mut tcp_read, mut tcp_write) = tcp.into_split();
-
-                            let f1 = tokio::io::copy(&mut tcp_read, &mut send);
-                            let f2 = tokio::io::copy(&mut recv, &mut tcp_write);
-
-                            let (bytes_sent, bytes_received) = futures::future::join(f1, f2).await;
-
-                            println!(
-                                "QUIC: {} -> TCP: {}, bytes sent: {:?}, bytes received: {:?}",
-                                conn.remote_address(),
-                                forward_to,
-                                bytes_sent,
-                                bytes_received,
-                            );
-                        }
-                        Err(err) => {
-                            eprintln!("{}", err)
-                        }
-                    }
-                });
+            Ok((send, recv)) => {
+                tokio::spawn(new_tcp_conn(forward_to, send, recv));
             }
             Err(err) => {
                 eprintln!("{}", err);
@@ -69,5 +46,26 @@ pub async fn handle_incoming(conn: Incoming, forward_to: SocketAddr) -> anyhow::
             }
         }
     }
+    Ok(())
+}
+
+async fn new_tcp_conn(
+    forward_to: SocketAddr,
+    mut send: SendStream,
+    mut recv: RecvStream,
+) -> anyhow::Result<()> {
+    let tcp = TcpStream::connect(forward_to).await?;
+    let sock_ref = socket2::SockRef::from(&tcp);
+    let mut ka = socket2::TcpKeepalive::new();
+    ka = ka.with_time(Duration::from_secs(30));
+    ka = ka.with_interval(Duration::from_secs(30));
+    sock_ref.set_tcp_keepalive(&ka)?;
+
+    let (mut tcp_read, mut tcp_write) = tcp.into_split();
+
+    let f1 = tokio::io::copy(&mut tcp_read, &mut send);
+    let f2 = tokio::io::copy(&mut recv, &mut tcp_write);
+
+    let _ = futures::future::join(f1, f2).await;
     Ok(())
 }
